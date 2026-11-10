@@ -61,6 +61,10 @@ class CodexBackendTests(unittest.IsolatedAsyncioTestCase):
         backend = patch.object(codex_backend, "LLM_BACKEND", "codex")
         backend.start()
         self.addCleanup(backend.stop)
+        # These tests cover Codex alone; tests/test_claude_backend.py covers fallback.
+        no_fallback = patch.object(codex_backend, "LLM_FALLBACK_BACKEND", "")
+        no_fallback.start()
+        self.addCleanup(no_fallback.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.fake_bin = self.root / "fake-codex"

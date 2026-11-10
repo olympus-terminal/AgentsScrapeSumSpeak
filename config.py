@@ -51,7 +51,8 @@ CODEX_MAX_WRITER_ATTEMPTS = _env_positive_int("CODEX_MAX_WRITER_ATTEMPTS", 2)
 CODEX_RETRY_DELAY_SECONDS = _env_positive_float("CODEX_RETRY_DELAY_SECONDS", 5)
 
 # Local/OpenAI-compatible models use a recording proxy; Codex remains opt-in
-# through the original default. Never silently switch providers on a failure.
+# through the original default. Providers switch only through the explicit
+# LLM_FALLBACK_BACKEND below, and every switch is logged and recorded.
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "codex").strip()
 if LLM_BACKEND not in {"codex", "openai_compatible"}:
     raise ValueError("LLM_BACKEND must be codex or openai_compatible")
@@ -60,6 +61,23 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "").strip()
 LLM_DEPLOYMENT = os.environ.get("LLM_DEPLOYMENT", "").strip()
 LLM_MAX_TOKENS = _env_positive_int("LLM_MAX_TOKENS", 16384)
 LLM_ENABLE_THINKING = _env_bool("LLM_ENABLE_THINKING", False)
+
+# === Optional fallback model: Claude through the Claude Code CLI ===
+# claude_cli uses the saved `claude auth login` subscription, not an API key.
+# It takes over a whole cycle when the primary model fails its preflight, a
+# single call when the primary endpoint errors, and a judge batch or writer
+# segment whose primary output failed validation. Empty disables fallback.
+LLM_FALLBACK_BACKEND = os.environ.get("LLM_FALLBACK_BACKEND", "").strip()
+if LLM_FALLBACK_BACKEND not in {"", "claude_cli"}:
+    raise ValueError("LLM_FALLBACK_BACKEND must be empty or claude_cli")
+if LLM_FALLBACK_BACKEND == LLM_BACKEND:
+    raise ValueError("LLM_FALLBACK_BACKEND must differ from LLM_BACKEND")
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", shutil.which("claude") or "claude")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5").strip()
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip()  # empty: model default
+if CLAUDE_EFFORT not in {"", "low", "medium", "high", "xhigh", "max"}:
+    raise ValueError("CLAUDE_EFFORT must be empty or low, medium, high, xhigh, max")
+CLAUDE_MAX_FALLBACK_ATTEMPTS = _env_positive_int("CLAUDE_MAX_FALLBACK_ATTEMPTS", 2)
 
 # === TTS (optional — omit to skip audio synthesis) ===
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "local_coqui")

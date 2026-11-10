@@ -15,9 +15,12 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from codex_backend import CodexExecError, run_codex, backend_identity
+from codex_backend import (
+    CodexExecError, run_codex, backend_identity, fallback_backend, primary_backend,
+)
 from config import (
     AUDIO_DIR,
+    CLAUDE_MAX_FALLBACK_ATTEMPTS,
     CODEX_MAX_WRITER_ATTEMPTS,
     CODEX_RETRY_DELAY_SECONDS,
     CODEX_WRITER_TIMEOUT_SECONDS,
@@ -40,6 +43,8 @@ from queue_manager import ContentItem
 log = logging.getLogger(__name__)
 WRITER_SCHEMA = Path(__file__).parent / "schemas" / "writer_segment.schema.json"
 _TTS_PREFLIGHT_CACHE: dict | None = None
+# Backend that wrote each segment of the most recent script, for provenance.
+_LAST_SEGMENT_BACKENDS: list[str] = []
 
 
 @dataclass(frozen=True)
@@ -344,47 +349,88 @@ async def _call_codex_scriptwriter(
     instruction: str = SCRIPT_WRITER_INSTRUCTION,
     expected_indices: set[int] | None = None,
     minimum_words: int = 1,
+    used_backends: list[str] | None = None,
 ) -> str | None:
-    for attempt in range(1, CODEX_MAX_WRITER_ATTEMPTS + 1):
+    """Write one segment on the primary model, then on the fallback if set.
+
+    The backend that wrote the accepted segment is appended to
+    ``used_backends``.
+    """
+    primary = primary_backend()
+    phases = [(primary, CODEX_MAX_WRITER_ATTEMPTS)]
+    fallback = fallback_backend(primary)
+    if fallback:
+        phases.append((fallback, CLAUDE_MAX_FALLBACK_ATTEMPTS))
+    for phase, (backend, attempts) in enumerate(phases):
+        if phase:
+            log.warning(
+                "Writer failed on %s after %s attempts; handing this segment to fallback %s",
+                phases[phase - 1][0], phases[phase - 1][1], backend,
+            )
+        segment = await _write_segment_attempts(
+            content, backend, attempts,
+            instruction=instruction,
+            expected_indices=expected_indices,
+            minimum_words=minimum_words,
+        )
+        if segment is not None:
+            if used_backends is not None:
+                used_backends.append(backend)
+            return segment
+    return None
+
+
+async def _write_segment_attempts(
+    content: str,
+    backend: str,
+    max_attempts: int,
+    *,
+    instruction: str,
+    expected_indices: set[int] | None,
+    minimum_words: int,
+) -> str | None:
+    for attempt in range(1, max_attempts + 1):
         try:
             result = await run_codex(
                 instruction,
                 content,
                 timeout_seconds=CODEX_WRITER_TIMEOUT_SECONDS,
                 output_schema=WRITER_SCHEMA,
+                backend=backend,
             )
             data = json.loads(result)
             if not isinstance(data, dict) or set(data) != {"covered_item_indices", "segment"}:
-                raise ValueError("Codex writer result does not match the required contract")
+                raise ValueError("Writer result does not match the required contract")
             covered = data["covered_item_indices"]
             if (
                 not isinstance(covered, list)
                 or any(type(index) is not int for index in covered)
                 or len(set(covered)) != len(covered)
             ):
-                raise ValueError("Codex writer returned invalid coverage indices")
+                raise ValueError("Writer returned invalid coverage indices")
             if expected_indices is not None and set(covered) != expected_indices:
                 raise ValueError(
-                    f"Codex writer covered indices {sorted(set(covered))}; "
+                    f"Writer covered indices {sorted(set(covered))}; "
                     f"expected {sorted(expected_indices)}"
                 )
             segment = data["segment"]
             if not isinstance(segment, str) or not segment.strip():
-                raise ValueError("Codex writer returned empty prose")
+                raise ValueError("Writer returned empty prose")
             word_count = len(segment.split())
             if word_count < minimum_words:
                 raise ValueError(
-                    f"Codex writer returned {word_count} words; minimum is {minimum_words}"
+                    f"Writer returned {word_count} words; minimum is {minimum_words}"
                 )
             return segment.strip()
         except (CodexExecError, json.JSONDecodeError, ValueError) as exc:
             log.warning(
-                "Writer attempt %s/%s failed: %s",
+                "Writer attempt %s/%s on %s failed: %s",
                 attempt,
-                CODEX_MAX_WRITER_ATTEMPTS,
+                max_attempts,
+                backend,
                 exc,
             )
-            if attempt < CODEX_MAX_WRITER_ATTEMPTS:
+            if attempt < max_attempts:
                 await asyncio.sleep(CODEX_RETRY_DELAY_SECONDS)
     return None
 
@@ -598,6 +644,8 @@ async def compose_digest_script(items: list[ContentItem]) -> Path | None:
     )
 
     segments = []
+    segment_backends: list[str] = []
+    _LAST_SEGMENT_BACKENDS.clear()
     for i, batch in enumerate(batches, 1):
         log.info(f"Writing segment {i}/{total_batches} ({len(batch)} items)")
         target_words = max(
@@ -610,6 +658,7 @@ async def compose_digest_script(items: list[ContentItem]) -> Path | None:
             instruction=_writer_instruction(i, total_batches, target_words),
             expected_indices=set(range(1, len(batch) + 1)),
             minimum_words=max(50, int(target_words * 0.35)),
+            used_backends=segment_backends,
         )
         if segment:
             segments.append(segment)
@@ -621,6 +670,9 @@ async def compose_digest_script(items: list[ContentItem]) -> Path | None:
         log.error("Failed to generate any script segments")
         return None
 
+    _LAST_SEGMENT_BACKENDS.extend(segment_backends)
+    if any(backend != segment_backends[0] for backend in segment_backends):
+        log.warning("Digest segments came from more than one model: %s", segment_backends)
     full_script = "\n\n".join(segments)
     word_count = len(full_script.split())
     script_path.write_text(full_script)
@@ -954,7 +1006,12 @@ def save_digest_metadata(
 
     meta = {
         "timestamp": now.isoformat(),
-        "writer_model": backend_identity(),
+        "writer_model": backend_identity(
+            _LAST_SEGMENT_BACKENDS[0] if _LAST_SEGMENT_BACKENDS else None
+        ),
+        "writer_segment_models": [
+            backend_identity(backend) for backend in _LAST_SEGMENT_BACKENDS
+        ],
         "item_count": len(items),
         "script_path": str(script_path),
         "source_notes_path": str(published_notes_path.resolve()),

@@ -88,8 +88,27 @@ proxy. Set `LLM_BACKEND=openai_compatible`, `LLM_BASE_URL` to the proxy's `/v1`
 URL, and `LLM_MODEL` to its exact advertised model ID. The client uses tool-free
 chat completions with JSON schemas and checks the returned model, completion
 status, and the existing judge/writer contracts. It rejects truncated responses
-and tool calls. Endpoint failure follows the existing bounded retry policy;
-it never silently falls back to a cloud model.
+and tool calls. Endpoint failure follows the existing bounded retry policy.
+
+Set `LLM_FALLBACK_BACKEND=claude_cli` to let Claude (default
+`CLAUDE_MODEL=claude-sonnet-5-5`) step in through the Claude Code CLI. It uses
+the saved `claude auth login` subscription, not an API key; an exported
+`ANTHROPIC_API_KEY` is removed from its environment. Each call replaces Claude
+Code's system prompt, disables every tool, MCP server, slash command and user
+customization, keeps no session, runs in an empty temporary directory, and
+passes source data on stdin. The fallback takes over:
+
+- the whole cycle, when the primary model fails its preflight;
+- one call, when the primary endpoint or CLI errors;
+- one judge batch, when the primary verdicts fail validation;
+- one writer segment, after `CODEX_MAX_WRITER_ATTEMPTS` invalid primary drafts
+  (for example, a segment that skips items), for up to
+  `CLAUDE_MAX_FALLBACK_ATTEMPTS` more drafts.
+
+Every switch is logged as a warning. Judged items record the model that judged
+them, and digest metadata records the writer of each segment
+(`writer_segment_models`). Claude calls are not in the recording proxy's ledger;
+`agent.log` keeps their token usage.
 
 For MiMo Flash MXFP4 on a two-GPU llama.cpp server, start with one server slot,
 32,768 context tokens, one judge worker, batches of six, and a 1,800-second judge

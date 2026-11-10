@@ -38,6 +38,8 @@ class CompatibleBackendTests(unittest.IsolatedAsyncioTestCase):
             patch.object(backend, "LLM_BASE_URL", f"http://127.0.0.1:{port}/v1"),
             patch.object(backend, "LLM_MODEL", "local-test"),
             patch.object(codex_backend, "LLM_BACKEND", "openai_compatible"),
+            # Fallback disabled here; tests/test_claude_backend.py covers it.
+            patch.object(codex_backend, "LLM_FALLBACK_BACKEND", ""),
         ]
         for p in self.patches:
             p.start()
@@ -65,7 +67,7 @@ class CompatibleBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req["response_format"]["json_schema"]["schema"], {"type": "object"})
         self.assertNotIn("tools", req)
 
-    async def test_unavailable_or_wrong_model_never_falls_back(self):
+    async def test_unavailable_or_wrong_model_fails_without_fallback(self):
         with patch.object(backend, "LLM_MODEL", "missing"):
             with self.assertRaisesRegex(codex_backend.CodexExecError, "not advertised"):
                 await codex_backend.preflight_codex()

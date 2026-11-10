@@ -7,7 +7,9 @@ import json
 import logging
 from pathlib import Path
 
-from codex_backend import CodexExecError, run_codex, backend_identity
+from codex_backend import (
+    CodexExecError, run_codex, backend_identity, fallback_backend, primary_backend,
+)
 from config import (
     CODEX_JUDGE_BATCH_SIZE,
     CODEX_JUDGE_BATCH_WAIT_SECONDS,
@@ -136,17 +138,25 @@ def _validate_batch_result(data: object, expected_count: int) -> list[dict]:
 
 
 async def _call_codex_judge(items: list[ContentItem]) -> list[dict] | None:
-    try:
-        output = await run_codex(
-            JUDGE_INSTRUCTION,
-            _format_batch_for_judge(items),
-            timeout_seconds=CODEX_JUDGE_TIMEOUT_SECONDS,
-            output_schema=JUDGE_SCHEMA,
-        )
-        return _validate_batch_result(json.loads(output), len(items))
-    except (CodexExecError, json.JSONDecodeError, ValueError) as exc:
-        log.warning("Judge model batch failed: %s", exc)
-        return None
+    """Judge a batch on the primary model; an invalid result goes to the fallback."""
+    primary = primary_backend()
+    backends = [primary]
+    fallback = fallback_backend(primary)
+    if fallback:
+        backends.append(fallback)
+    for backend in backends:
+        try:
+            output = await run_codex(
+                JUDGE_INSTRUCTION,
+                _format_batch_for_judge(items),
+                timeout_seconds=CODEX_JUDGE_TIMEOUT_SECONDS,
+                output_schema=JUDGE_SCHEMA,
+                backend=backend,
+            )
+            return _validate_batch_result(json.loads(output), len(items))
+        except (CodexExecError, json.JSONDecodeError, ValueError) as exc:
+            log.warning("Judge model batch failed on %s: %s", backend, exc)
+    return None
 
 
 async def _next_batch(queue: ContentQueue, stop_event: asyncio.Event) -> list[ContentItem]:

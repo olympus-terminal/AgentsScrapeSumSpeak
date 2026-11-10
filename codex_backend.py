@@ -10,11 +10,13 @@ import re
 import signal
 import tempfile
 from contextlib import suppress
+from contextvars import ContextVar
 from pathlib import Path
 
 from config import (
     CODEX_BIN, CODEX_IGNORE_USER_CONFIG, CODEX_MODEL,
     LLM_BACKEND, LLM_MODEL, LLM_DEPLOYMENT,
+    LLM_FALLBACK_BACKEND, CLAUDE_MODEL,
 )
 
 log = logging.getLogger(__name__)
@@ -115,20 +117,43 @@ def _validate_events(stdout: str) -> None:
         raise CodexExecError("Codex exited without a turn.completed event")
 
 
-async def run_codex(
+# Backend that produced the most recent successful result in this task.
+_LAST_BACKEND: ContextVar[str | None] = ContextVar("llm_last_backend", default=None)
+# Set for one cycle when the primary model fails its preflight.
+_cycle_backend: str | None = None
+
+
+def primary_backend() -> str:
+    """Backend calls start on: the fallback for a cycle whose preflight failed."""
+    return _cycle_backend or LLM_BACKEND
+
+
+def fallback_backend(current: str | None = None) -> str | None:
+    """The configured fallback, unless ``current`` already is that backend."""
+    current = current or primary_backend()
+    if LLM_FALLBACK_BACKEND and LLM_FALLBACK_BACKEND != current:
+        return LLM_FALLBACK_BACKEND
+    return None
+
+
+async def _call_backend(
+    backend: str,
     instruction: str,
     payload: str,
     *,
     timeout_seconds: int,
-    output_schema: Path | None = None,
+    output_schema: Path | None,
 ) -> str:
-    """Run one isolated Codex transform and return its final agent message.
-
-    ``instruction`` is trusted application text passed as the CLI prompt.
-    ``payload`` may contain untrusted scraped content and is sent through stdin,
-    which Codex presents as a separate input block.
-    """
-    if LLM_BACKEND == "openai_compatible":
+    if backend == "claude_cli":
+        from claude_backend import ClaudeCLIError, transform
+        try:
+            return await transform(
+                instruction, payload, timeout_seconds=timeout_seconds,
+                output_schema=output_schema,
+            )
+        except ClaudeCLIError as exc:
+            raise CodexExecError(str(exc)) from exc
+    if backend == "openai_compatible":
         from compatible_backend import ModelError, transform
         try:
             return await transform(
@@ -137,6 +162,56 @@ async def run_codex(
             )
         except ModelError as exc:
             raise CodexExecError(str(exc)) from exc
+    return await _run_codex_cli(
+        instruction, payload, timeout_seconds=timeout_seconds, output_schema=output_schema,
+    )
+
+
+async def run_codex(
+    instruction: str,
+    payload: str,
+    *,
+    timeout_seconds: int,
+    output_schema: Path | None = None,
+    backend: str | None = None,
+) -> str:
+    """Run one isolated model transform and return its final message.
+
+    ``instruction`` is trusted application text. ``payload`` may contain
+    untrusted scraped content and is always passed separately from it.
+    Without an explicit ``backend``, a failed call on the primary backend is
+    retried once on the configured fallback.
+    """
+    chosen = backend or primary_backend()
+    try:
+        result = await _call_backend(
+            chosen, instruction, payload,
+            timeout_seconds=timeout_seconds, output_schema=output_schema,
+        )
+    except CodexExecError as exc:
+        fallback = None if backend else fallback_backend(chosen)
+        if fallback is None:
+            raise
+        log.warning(
+            "Model call on %s failed (%s); retrying on fallback %s", chosen, exc, fallback,
+        )
+        chosen = fallback
+        result = await _call_backend(
+            chosen, instruction, payload,
+            timeout_seconds=timeout_seconds, output_schema=output_schema,
+        )
+    _LAST_BACKEND.set(chosen)
+    return result
+
+
+async def _run_codex_cli(
+    instruction: str,
+    payload: str,
+    *,
+    timeout_seconds: int,
+    output_schema: Path | None = None,
+) -> str:
+    """Run one isolated ``codex exec`` transform (payload through stdin)."""
     if not instruction.strip():
         raise ValueError("Codex instruction must not be empty")
     if timeout_seconds <= 0:
@@ -231,9 +306,44 @@ async def run_codex(
 
 
 async def preflight_codex(timeout_seconds: int = 15) -> tuple[str, str]:
-    """Check the configured model endpoint or CLI and saved authentication."""
+    """Check the primary model, or switch this cycle to the fallback.
 
-    if LLM_BACKEND == "openai_compatible":
+    Called at the start of every cycle, so it also resets the previous
+    cycle's switch.
+    """
+    global _cycle_backend
+    _cycle_backend = None
+    try:
+        return await _preflight_backend(LLM_BACKEND, timeout_seconds)
+    except CodexExecError as exc:
+        fallback = fallback_backend(LLM_BACKEND)
+        if fallback is None:
+            raise
+        log.warning(
+            "Primary model %s failed preflight (%s); trying fallback %s for this cycle",
+            LLM_BACKEND, exc, fallback,
+        )
+        try:
+            result = await _preflight_backend(fallback, timeout_seconds)
+        except CodexExecError as fallback_exc:
+            raise CodexExecError(
+                f"{exc}; fallback {fallback} also failed: {fallback_exc}"
+            ) from fallback_exc
+        _cycle_backend = fallback
+        log.warning("This cycle runs on fallback %s", backend_identity(fallback))
+        return result
+
+
+async def _preflight_backend(backend: str, timeout_seconds: int) -> tuple[str, str]:
+    """Check one backend's endpoint or CLI and saved authentication."""
+    if backend == "claude_cli":
+        from claude_backend import ClaudeCLIError, preflight
+        try:
+            return await preflight(timeout_seconds)
+        except ClaudeCLIError as exc:
+            raise CodexExecError(str(exc)) from exc
+
+    if backend == "openai_compatible":
         from compatible_backend import ModelError, preflight
         try:
             return await preflight(timeout_seconds)
@@ -271,10 +381,13 @@ async def preflight_codex(timeout_seconds: int = 15) -> tuple[str, str]:
     return version, auth
 
 
-def backend_identity() -> dict:
-    """Configured identity; local calls also verify the response model name."""
-    return {
-        "backend": LLM_BACKEND,
-        "model": LLM_MODEL if LLM_BACKEND == "openai_compatible" else CODEX_MODEL or "cli_default",
-        "deployment": LLM_DEPLOYMENT or None,
-    }
+def backend_identity(backend: str | None = None) -> dict:
+    """Identity of ``backend``, else of the backend behind this task's last
+    successful call, else of the backend calls currently start on. Local and
+    Claude calls also verify the response model name."""
+    backend = backend or _LAST_BACKEND.get() or primary_backend()
+    if backend == "claude_cli":
+        return {"backend": backend, "model": CLAUDE_MODEL, "deployment": "claude-code-cli"}
+    if backend == "openai_compatible":
+        return {"backend": backend, "model": LLM_MODEL, "deployment": LLM_DEPLOYMENT or None}
+    return {"backend": backend, "model": CODEX_MODEL or "cli_default", "deployment": None}
