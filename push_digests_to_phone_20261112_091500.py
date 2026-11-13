@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy digest MP3s a phone does not have to its Music folder and record every transfer.
+"""Copy digest MP3s a phone does not have to its digest folder and record every transfer.
 
 Each verified file gets one row in a tab-separated record (default
 output/phone_transfers.tsv, git-ignored so it never reaches the public repo):
@@ -8,17 +8,22 @@ was copied now or was already on the phone. A file counts as on the phone only
 when the phone's copy has the same size and SHA-256 as the local file.
 
 Phones (one MTP client at a time; never run two copies at once):
-  honor   HONOR LLY-NX1 via its GVfs mount. Its Music folder is never listed,
+Digests go to "AI Research Digests" beside Music. --organize moves digests
+already in Music there (a rename on the phone, checked by object id, size and
+SHA-256) and records each move.
+
+  honor   HONOR LLY-NX1 via its GVfs mount. Its folders are never listed,
           because listing has hung gvfsd-mtp on this phone; files already in
           the record for the honor are skipped, the rest are copied with
           `cp --update=none`, so a same-named file already there is kept and
           checked instead of overwritten.
-  huawei  HUAWEI EVR-L29 via its GVfs mount. Music is listed; same-named files
-          there are checked, missing ones are copied.
+  huawei  HUAWEI EVR-L29 via its GVfs mount. The digest folder is listed;
+          same-named files there are checked, missing ones are copied.
 
 Usage:
     python push_digests_to_phone_20261112_091500.py --device huawei --dry-run
     python push_digests_to_phone_20261112_091500.py --device huawei
+    python push_digests_to_phone_20261112_091500.py --device huawei --organize
     python push_digests_to_phone_20261112_091500.py --backfill-log LOG --device honor
 """
 
@@ -42,6 +47,7 @@ SCRIPT_VERSION = "20261112_091500"
 load_dotenv(Path(__file__).parent / ".env")
 DEVICES = {name: os.environ.get(f"PHONE_MTP_{name.upper()}", "") for name in ("honor", "huawei")}
 STORAGE_ROOTS = ("Internal storage", "Internal shared storage", "Phone")
+DIGEST_FOLDER = "AI Research Digests"  # beside Music on each phone
 FIELDS = ["checked_at", "device", "device_id", "phone_path", "file", "bytes",
           "sha256", "action", "verified", "script", "note"]
 
@@ -90,6 +96,77 @@ def music_dir(device: str) -> Path:
     sys.exit(f"ERROR: no Music folder under {mount} ({', '.join(STORAGE_ROOTS)}).")
 
 
+def digest_dir(device: str) -> Path:
+    """The digest folder beside Music; created on first use."""
+    folder = music_dir(device).parent / DIGEST_FOLDER
+    if not folder.is_dir():
+        folder.mkdir()
+    return folder
+
+
+def object_id(path: Path) -> str | None:
+    """The phone's MTP object id for a path (same id before and after = moved, not copied)."""
+    result = subprocess.run(["gio", "info", "-a", "id::file", str(path)],
+                            capture_output=True, text=True, timeout=60)
+    match = re.search(r"id::file: \S+:(\d+)", result.stdout)
+    return match.group(1) if match else None
+
+
+def organize(args) -> int:
+    """Move digests already on the phone from Music into the digest folder.
+
+    Files are renamed on the phone, never deleted. After a move GVfs may still
+    show the old Music path from its cache; that entry is the same phone object
+    as the moved file, so it must not be removed. It disappears on reconnect.
+    """
+    music, folder = music_dir(args.device), digest_dir(args.device)
+    rows = read_record(args.record)
+    latest = {}
+    for row in rows:
+        if row["device"] == args.device and row["verified"] == "size+sha256":
+            latest[row["file"]] = row
+    if args.device == "honor":
+        # Music is never listed on the honor: move what the record says is in Music.
+        names = sorted(n for n, r in latest.items() if "/Music/" in r["phone_path"])
+    else:
+        names = sorted(n for n in os.listdir(music)
+                       if n.startswith("ai_research_digest_") and n.endswith(".mp3"))
+    print(f"{args.device}: {len(names)} digests to move {music} -> {folder}")
+    problems = 0
+    for name in reversed(names):
+        src, dst, local = music / name, folder / name, args.source / name
+        if args.dry_run:
+            print(f"  would move {name}")
+            continue
+        before = object_id(src)
+        if not dst.exists():
+            result = subprocess.run(["mv", "-n", str(src), str(dst)], capture_output=True,
+                                    text=True)
+            if result.returncode != 0:
+                print(f"  FAIL mv {name}: {result.stderr.strip()}")
+                problems += 1
+                continue
+        after = object_id(dst)
+        if local.exists():
+            ok, size, digest = verify(local, dst)
+        else:  # a digest no longer kept on this computer: record what the phone has
+            ok, size, digest = None, dst.stat().st_size, sha256(dst)
+        moved = before is not None and before == after
+        verified = "size+sha256" if ok else ("no local copy" if ok is None else "MISMATCH")
+        append_row(args.record, {
+            "checked_at": now(), "device": args.device, "device_id": DEVICES[args.device],
+            "phone_path": str(dst.relative_to(music.parent.parent)), "file": name,
+            "bytes": size, "sha256": digest, "action": "moved" if moved else "move_unconfirmed",
+            "verified": verified, "script": Path(__file__).name,
+            "note": f"from Music; object id {before} -> {after}",
+        })
+        print(f"  {'OK' if ok is not False and moved else 'CHECK'} "
+              f"{'moved' if moved else 'move_unconfirmed'} {name} {verified}")
+        problems += not (moved and ok is not False)
+    print(f"done, problems={problems}, record: {args.record}")
+    return 1 if problems else 0
+
+
 def verify(local: Path, remote: Path) -> tuple[bool, int, str]:
     size, digest = local.stat().st_size, sha256(local)
     try:
@@ -100,7 +177,7 @@ def verify(local: Path, remote: Path) -> tuple[bool, int, str]:
 
 
 def push(args) -> int:
-    music = music_dir(args.device)
+    music = digest_dir(args.device)
     local_files = sorted(args.source.glob("ai_research_digest_*.mp3"), reverse=True)
     recorded = {r["file"] for r in read_record(args.record)
                 if r["device"] == args.device and r["verified"] == "size+sha256"}
@@ -175,6 +252,8 @@ def main() -> int:
     parser.add_argument("--record", type=Path,
                         default=Path(__file__).resolve().parent / "output" / "phone_transfers.tsv")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--organize", action="store_true",
+                        help=f"move digests from Music into '{DIGEST_FOLDER}'")
     parser.add_argument("--backfill-log", type=Path,
                         help="record an earlier push from lines 'HH:MM:SS OK copied|existing FILE BYTES'")
     parser.add_argument("--log-date", help="date of the backfilled push, YYYY-MM-DD")
@@ -186,7 +265,7 @@ def main() -> int:
         if not args.log_date:
             parser.error("--backfill-log needs --log-date")
         return backfill(args)
-    return push(args)
+    return organize(args) if args.organize else push(args)
 
 
 if __name__ == "__main__":
