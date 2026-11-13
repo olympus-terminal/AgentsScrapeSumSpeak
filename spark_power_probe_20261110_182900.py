@@ -11,7 +11,7 @@ Usage:
     python spark_power_probe_20261110_182900.py \
         --call-id 20261110_112620_xxxxxxxx \
         --hosts spark4 spark3 \
-        --url http://127.0.0.1:18001/v1/chat/completions
+        --url http://127.0.0.1:18021/v1/chat/completions
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def main() -> int:
     parser.add_argument("--ledger", type=Path,
                         default=Path("/media/drn2/External/cluster_agents/ledger"))
     parser.add_argument("--hosts", nargs="+", default=["spark4", "spark3"])
-    parser.add_argument("--url", default="http://127.0.0.1:18001/v1/chat/completions")
+    parser.add_argument("--url", default="http://127.0.0.1:18021/v1/chat/completions")
     parser.add_argument("--idle-seconds", type=float, default=15)
     parser.add_argument("--out", type=Path, default=Path("output/reports"))
     args = parser.parse_args()

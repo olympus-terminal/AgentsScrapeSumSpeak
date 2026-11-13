@@ -87,3 +87,19 @@ class CompatibleBackendTests(unittest.IsolatedAsyncioTestCase):
             self.reply = reply
             with self.subTest(error=error), self.assertRaisesRegex(backend.ModelError, error):
                 await backend.transform("instruction", "data", timeout_seconds=2)
+
+    async def test_start_command_runs_before_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "started"
+            with patch.object(codex_backend, "LLM_START_COMMAND", f"touch {marker}"):
+                self.assertEqual((await codex_backend.preflight_codex())[0], "local-test")
+            self.assertTrue(marker.exists())
+
+    async def test_failed_or_hung_start_command_leaves_decision_to_preflight(self):
+        for command in ("exit 3", "sleep 30"):
+            with self.subTest(command=command), \
+                    patch.object(codex_backend, "LLM_START_COMMAND", command), \
+                    patch.object(codex_backend, "LLM_START_TIMEOUT_SECONDS", 1), \
+                    self.assertLogs("codex_backend", "WARNING") as logs:
+                self.assertEqual((await codex_backend.preflight_codex())[0], "local-test")
+            self.assertIn("start command", logs.output[0])

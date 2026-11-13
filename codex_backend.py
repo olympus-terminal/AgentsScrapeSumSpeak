@@ -305,6 +305,40 @@ async def _run_codex_cli(
         return final
 
 
+# Optional command that brings the primary model's server up before the
+# preflight (the digest owns its MiMo server on the Sparks). config imports
+# .env, so these are already in the environment.
+LLM_START_COMMAND = os.environ.get("LLM_START_COMMAND", "").strip()
+LLM_START_TIMEOUT_SECONDS = int(os.environ.get("LLM_START_TIMEOUT_SECONDS", "2700"))
+
+
+async def _start_primary_model() -> None:
+    """Run LLM_START_COMMAND; a failure is logged and the preflight decides."""
+    if not LLM_START_COMMAND:
+        return
+    log.info("Starting primary model: %s", LLM_START_COMMAND)
+    proc = await asyncio.create_subprocess_shell(
+        LLM_START_COMMAND,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        start_new_session=(os.name == "posix"),
+    )
+    try:
+        output, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=LLM_START_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        await _terminate_process_group(proc)
+        log.warning(
+            "Primary model start command timed out after %ss", LLM_START_TIMEOUT_SECONDS
+        )
+        return
+    for line in output.decode("utf-8", errors="replace").splitlines()[-10:]:
+        log.info("start command: %s", line)
+    if proc.returncode != 0:
+        log.warning("Primary model start command exited with status %s", proc.returncode)
+
+
 async def preflight_codex(timeout_seconds: int = 15) -> tuple[str, str]:
     """Check the primary model, or switch this cycle to the fallback.
 
@@ -313,6 +347,7 @@ async def preflight_codex(timeout_seconds: int = 15) -> tuple[str, str]:
     """
     global _cycle_backend
     _cycle_backend = None
+    await _start_primary_model()
     try:
         return await _preflight_backend(LLM_BACKEND, timeout_seconds)
     except CodexExecError as exc:
