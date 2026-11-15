@@ -101,12 +101,15 @@ async def preflight(timeout_seconds: float = 15) -> tuple[str, str]:
 async def transform(
     instruction: str, payload: str, *, timeout_seconds: float,
     output_schema: Path | None = None,
+    model: str | None = None,
 ) -> str:
+    """One Claude CLI call; ``model`` overrides CLAUDE_MODEL for this call only."""
+    model = model or CLAUDE_MODEL
     if not instruction.strip() or timeout_seconds <= 0:
         raise ValueError("A nonempty instruction and positive timeout are required")
     args = [
         "-p",
-        "--model", CLAUDE_MODEL,
+        "--model", model,
         "--output-format", "json",
         "--system-prompt", instruction,
         "--tools", "",
@@ -146,9 +149,9 @@ async def transform(
     if result.get("permission_denials"):
         raise ClaudeCLIError("Claude attempted a disallowed tool call")
     models = result.get("modelUsage") or {}
-    if CLAUDE_MODEL not in models:
+    if model not in models:
         raise ClaudeCLIError(
-            f"Response models {sorted(models)} do not include {CLAUDE_MODEL}"
+            f"Response models {sorted(models)} do not include {model}"
         )
 
     if output_schema is not None:
@@ -164,7 +167,7 @@ async def transform(
     usage = result.get("usage") or {}
     log.info(
         "Claude call complete: model=%s input=%s cache_read=%s output=%s list_cost_usd=%s",
-        CLAUDE_MODEL,
+        model,
         usage.get("input_tokens"),
         usage.get("cache_read_input_tokens"),
         usage.get("output_tokens"),

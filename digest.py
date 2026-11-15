@@ -39,6 +39,7 @@ from config import (
     WORDS_PER_MINUTE,
 )
 from queue_manager import ContentItem
+from tts_review import review_screening_sync
 
 log = logging.getLogger(__name__)
 WRITER_SCHEMA = Path(__file__).parent / "schemas" / "writer_segment.schema.json"
@@ -828,6 +829,14 @@ def synthesize_audio(
             elapsed = time.monotonic() - started_at
             manifest_path = output.parent / "tts_manifest.json"
             manifest_status = "structural_clean" if status == "CLEAN" else "review_needed"
+            # Claude reviews text-only screening flags; an approval drops _REVIEW_NEEDED.
+            claude_review = None
+            if status == "REVIEW_NEEDED":
+                claude_review = review_screening_sync(
+                    report_path, script_path, source_notes_path
+                )
+                if claude_review and claude_review["decision"] == "approve":
+                    manifest_status = "claude_reviewed"
             pipeline_path = Path(TTS_SCRIPT).resolve()
             toolkit_revision, toolkit_dirty = _toolkit_provenance(pipeline_path)
             compatibility_patch = Path(__file__).parent / "patches" / "gpu-tts-screening.patch"
@@ -869,6 +878,7 @@ def synthesize_audio(
                 "audio_issues_count": report.get("summary", {}).get("audio_issues_count"),
                 "screening_report": str(report_path.resolve()),
                 "screening_report_sha256": _sha256_file(report_path),
+                "claude_review": claude_review,
                 "pipeline_script": str(pipeline_path),
                 "pipeline_sha256": _sha256_file(pipeline_path),
                 "toolkit_revision": toolkit_revision,
@@ -925,7 +935,7 @@ def synthesize_audio(
                 manifest_status.upper(),
                 elapsed,
             )
-            approved = status == "CLEAN"
+            approved = manifest_status != "review_needed"
             if not approved:
                 log.error(
                     "TTS screening requires review; audio retained at %s, "
