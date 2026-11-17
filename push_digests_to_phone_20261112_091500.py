@@ -179,10 +179,29 @@ def verify(local: Path, remote: Path) -> tuple[bool, int, str]:
 def push(args) -> int:
     music = digest_dir(args.device)
     local_files = sorted(args.source.glob("ai_research_digest_*.mp3"), reverse=True)
-    recorded = {r["file"] for r in read_record(args.record)
-                if r["device"] == args.device and r["verified"] == "size+sha256"}
+    latest = {}
+    for row in read_record(args.record):
+        if row["device"] == args.device:
+            latest[row["file"]] = row
+    on_device = {n: r for n, r in latest.items()
+                 if r["verified"] == "size+sha256" and r["action"] != "removed_duplicate"}
+    recorded = set(on_device)
+    by_hash = {r["sha256"]: n for n, r in on_device.items()}
     on_phone = None if args.device == "honor" else set(os.listdir(music))
-    todo = [f for f in local_files if f.name not in recorded]
+    todo = []
+    for local in (f for f in local_files if f.name not in recorded):
+        # A digest renamed here (e.g. _REVIEW_NEEDED dropped) is already on the phone.
+        twin = by_hash.get(sha256(local))
+        if twin is None:
+            todo.append(local)
+        elif not args.dry_run:
+            append_row(args.record, {
+                "checked_at": now(), "device": args.device, "device_id": DEVICES[args.device],
+                "phone_path": on_device[twin]["phone_path"], "file": local.name,
+                "bytes": local.stat().st_size, "sha256": on_device[twin]["sha256"],
+                "action": "same_as_phone_file", "verified": "size+sha256",
+                "script": Path(__file__).name, "note": f"renamed locally; phone keeps {twin}",
+            })
     print(f"{args.device}: {len(local_files)} local digests, {len(recorded)} already recorded, "
           f"{len(todo)} to check/copy -> {music}")
     problems = 0
