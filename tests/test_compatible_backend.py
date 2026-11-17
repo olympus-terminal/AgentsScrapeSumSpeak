@@ -103,3 +103,16 @@ class CompatibleBackendTests(unittest.IsolatedAsyncioTestCase):
                     self.assertLogs("codex_backend", "WARNING") as logs:
                 self.assertEqual((await codex_backend.preflight_codex())[0], "local-test")
             self.assertIn("start command", logs.output[0])
+
+    async def test_stop_command_runs_and_never_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "stopped"
+            with patch.object(codex_backend, "LLM_STOP_COMMAND", f"touch {marker}"):
+                await codex_backend.stop_primary_model()
+            self.assertTrue(marker.exists())
+        for command in ("exit 3", "sleep 30"):
+            with self.subTest(command=command), \
+                    patch.object(codex_backend, "LLM_STOP_COMMAND", command), \
+                    patch.object(codex_backend, "LLM_STOP_TIMEOUT_SECONDS", 1), \
+                    self.assertLogs("codex_backend", "WARNING"):
+                await codex_backend.stop_primary_model()

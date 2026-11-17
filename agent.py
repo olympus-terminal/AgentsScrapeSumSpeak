@@ -33,7 +33,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from codex_backend import CodexExecError, preflight_codex, backend_identity
+from codex_backend import CodexExecError, preflight_codex, backend_identity, stop_primary_model
 from config import (
     BASE_DIR,
     CODEX_JUDGE_WORKERS,
@@ -506,6 +506,14 @@ async def _cancel_judges(judge_tasks: list[asyncio.Task], stop_event: asyncio.Ev
 
 
 async def run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = False):
+    """One cycle; the model server is released afterwards, even when the cycle fails."""
+    try:
+        return await _run_cycle(crawl=crawl, digest=digest, verbose=verbose)
+    finally:
+        await stop_primary_model()
+
+
+async def _run_cycle(crawl: bool = True, digest: bool = True, verbose: bool = False):
     cycle_started_at = _local_now()
     try:
         await preflight_codex()

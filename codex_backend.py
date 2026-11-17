@@ -310,6 +310,10 @@ async def _run_codex_cli(
 # .env, so these are already in the environment.
 LLM_START_COMMAND = os.environ.get("LLM_START_COMMAND", "").strip()
 LLM_START_TIMEOUT_SECONDS = int(os.environ.get("LLM_START_TIMEOUT_SECONDS", "2700"))
+# Optional command run after every cycle to release the model server until the
+# next cycle starts it again (2026-11-17: the server runs only while in use).
+LLM_STOP_COMMAND = os.environ.get("LLM_STOP_COMMAND", "").strip()
+LLM_STOP_TIMEOUT_SECONDS = int(os.environ.get("LLM_STOP_TIMEOUT_SECONDS", "300"))
 
 
 async def _start_primary_model() -> None:
@@ -337,6 +341,35 @@ async def _start_primary_model() -> None:
         log.info("start command: %s", line)
     if proc.returncode != 0:
         log.warning("Primary model start command exited with status %s", proc.returncode)
+
+
+async def stop_primary_model() -> None:
+    """Run LLM_STOP_COMMAND after a cycle. Never raises: a failure only leaves the server up."""
+    if not LLM_STOP_COMMAND:
+        return
+    log.info("Stopping primary model: %s", LLM_STOP_COMMAND)
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            LLM_STOP_COMMAND,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            output, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=LLM_STOP_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            await _terminate_process_group(proc)
+            log.warning("Stop command timed out after %ss", LLM_STOP_TIMEOUT_SECONDS)
+            return
+    except Exception as exc:  # noqa: BLE001 - the cycle's result must not depend on this
+        log.warning("Stop command could not run: %s", exc)
+        return
+    for line in output.decode("utf-8", errors="replace").splitlines()[-10:]:
+        log.info("stop command: %s", line)
+    if proc.returncode != 0:
+        log.warning("Stop command exited with status %s (server left running)", proc.returncode)
 
 
 async def preflight_codex(timeout_seconds: int = 15) -> tuple[str, str]:

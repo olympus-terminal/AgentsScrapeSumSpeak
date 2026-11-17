@@ -8,11 +8,14 @@
 #   ensure    Run by the digest before each cycle (LLM_START_COMMAND). Starts the digest's
 #             units, waits until the recording proxy lists the model, and repairs a stalled
 #             server once. Exit 0 = ready.
-#   stop [--force]  Stop the server cleanly: the laptop units first (so they cannot restart it),
-#             then the server on spark4 and the worker on spark3 (systemd units and any tmux
-#             sessions named mimo/rpcsrv). Refuses with exit 3 while the digest's daily run is
-#             using MiMo, unless --force. An unreachable Spark counts as already stopped.
-#             Used by mimo-spark when its window closes and by shs/sds before powering off.
+#   stop [--after-digest|--force]  Stop the server cleanly: the laptop units first (so they
+#             cannot restart it), then the server on spark4 and the worker on spark3 (systemd
+#             units and any tmux sessions named mimo/rpcsrv). Exit 3, server left running, while
+#             it is in use: the digest's daily run (skipped with --after-digest, which the digest
+#             passes at the end of its own run) or an open mimo-spark session (its lock is held).
+#             --force skips both checks. An unreachable Spark counts as already stopped.
+#             Callers: the digest after each run (LLM_STOP_COMMAND), mimo-spark when its session
+#             or window closes, shs/sds before powering off. The server runs only while used.
 #
 # Units (laptop, ~/.config/systemd/user): ai-digest-mimo-worker-link (ssh spark3, keeps the
 # worker), ai-digest-mimo-tunnel (127.0.0.1:18021 -> spark4:8084), ai-digest-mimo-proxy
@@ -30,6 +33,7 @@ WAIT_SECONDS=${MIMO_START_WAIT_SECONDS:-1200}   # per attempt; a cold load takes
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10)
 
 AGENT_LOG=$(dirname "$(readlink -f "$0")")/agent.log
+SESSION_LOCK=/media/drn2/External/cluster_agents/local/state/mimospark.launch.lock
 
 say() { echo "[mimo-spark-service] $(date '+%F %T') $*" >&2; }
 
@@ -89,6 +93,12 @@ digest_busy() {
     [[ "$last" == *"Starting primary model"* || "$last" == *"=== Cycle start"* ]]
 }
 
+# True while a mimo-spark session holds its launch lock.
+session_open() {
+    [[ -e "$SESSION_LOCK" ]] || return 1
+    ! flock -n "$SESSION_LOCK" true
+}
+
 # Stop a unit and a tmux session on one node and wait until the port is free.
 # ssh exit 255 (node unreachable, e.g. already powered off) counts as stopped.
 stop_node() {
@@ -104,8 +114,14 @@ stop_node() {
 }
 
 stop() {
-    if [[ "${1:-}" != --force ]] && digest_busy; then
+    local mode=${1:-}
+    case "$mode" in ""|--after-digest|--force) ;; *) echo "unknown stop option: $mode" >&2; exit 2 ;; esac
+    if [[ -z "$mode" ]] && digest_busy; then
         say "the research digest's daily run is using MiMo right now; leaving the server running"
+        exit 3
+    fi
+    if [[ "$mode" != --force ]] && session_open; then
+        say "a mimo-spark session is open; leaving the server running (it stops when that session closes)"
         exit 3
     fi
     systemctl --user stop "${UNITS[@]}"
@@ -119,5 +135,5 @@ case "${1:-}" in
     prepare) prepare ;;
     ensure) ensure ;;
     stop) stop "${2:-}" ;;
-    *) echo "usage: $0 prepare|ensure|stop [--force]" >&2; exit 2 ;;
+    *) echo "usage: $0 prepare|ensure|stop [--after-digest|--force]" >&2; exit 2 ;;
 esac

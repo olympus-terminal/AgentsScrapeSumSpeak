@@ -675,5 +675,21 @@ class StartupInstallerTests(unittest.TestCase):
         run_async.assert_not_called()
 
 
+class ModelReleaseTests(unittest.IsolatedAsyncioTestCase):
+    """run_cycle releases the model server after every cycle (LLM_STOP_COMMAND)."""
+
+    async def test_stop_runs_after_success_and_after_failure(self):
+        stop = AsyncMock()
+        with patch.object(agent, "stop_primary_model", stop), \
+                patch.object(agent, "_run_cycle", AsyncMock(return_value=True)):
+            self.assertTrue(await agent.run_cycle(crawl=False, digest=True))
+        self.assertEqual(stop.await_count, 1)
+        with patch.object(agent, "stop_primary_model", stop), \
+                patch.object(agent, "_run_cycle", AsyncMock(side_effect=RuntimeError("boom"))):
+            with self.assertRaises(RuntimeError):
+                await agent.run_cycle()
+        self.assertEqual(stop.await_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
