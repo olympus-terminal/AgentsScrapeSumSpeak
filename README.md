@@ -48,8 +48,8 @@ The two language-model roles are deliberately narrow:
 ## Setup
 
 ```bash
-git clone https://github.com/olympus-terminal/M3_netscape_navigator.git
-cd M3_netscape_navigator
+git clone https://github.com/olympus-terminal/AgentsScrapeSumSpeak.git
+cd AgentsScrapeSumSpeak
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env
